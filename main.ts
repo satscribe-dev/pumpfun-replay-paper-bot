@@ -14,7 +14,7 @@
 //   - size cap >= MIN_BUY (0.01 SOL) and real SOL reserve <= 80 SOL (the
 //     migration cluster sits at ~85 SOL in dev data, so stay clear of it);
 //   - at least 3 trades seen, net buy SOL over the last 10 trades > 0,
-//     at least 2 distinct buyers, price up >= 3% since the first trade;
+//     at least 2 distinct buyers;
 //   - buy min(cap, INITIAL_STAKE). Pyramid: while spent < TOTAL_STAKE and
 //     the price is >= 5% above the last buy's decision price and inflow is
 //     still positive, add min(cap, ADD_STAKE).
@@ -22,13 +22,14 @@
 // Exit (sell the whole position on the first trigger):
 //   - stop loss: mark value <= 75% of cost;
 //   - trailing stop: mark value <= 85% of the best mark value since entry;
-//   - time: held longer than MAX_HOLD slots;
-//   - probe positions (see below) are sold as soon as their buy lands.
+//   - time: held longer than MAX_HOLD slots.
 //
-// Guardrail pacing: the run must round-trip >= 0.01 SOL on >= 20 coins.
-// When coins traded lag the pace (25 coins over ~403k slots), the bot buys
-// a 0.01 SOL probe of the most liquid fresh curve in the batch, ignoring
-// the flow filters, and sells it the moment the buy fills.
+// v2 note: v1 also had a "rise >= 3% since first trade" filter and a pace
+// probe that bought 0.01 SOL when coins-traded lagged. Both are gone: the
+// rise filter could never fire (the first price is measured after the
+// opening pump, so price-now ~= first price) and the probes were the only
+// trades v1 ever made — 27/27 buys, each losing ~its own fees. Entry is
+// now flow-only: cap + positive net inflow + >= 2 buyers.
 //
 // Determinism: no clock, no environment, no Math.random — every decision
 // comes from the hello/batch stream, iterated in insertion order.
@@ -56,14 +57,10 @@ const TRAIL_ARM = 1.0; // trail arms once value is above cost (always, here).
 const MIN_TRADES = 3; // trades seen before an entry is allowed.
 const TAPE_LEN = 10; // trades kept per mint for the flow check.
 const MIN_BUYERS = 2; // distinct buyers in the tape.
-const MIN_RISE = 0.03; // price up >= 3% since the tape's first trade.
 const ADD_RISE = 0.05; // pyramid only >= 5% above the last buy's price.
 const MAX_HOLD_SLOTS = 200_000; // ~12 h of the 24 h window.
 const COOLDOWN_SLOTS = 5_000; // do not rebuy a mint right after exiting.
 const NEAR_MIGRATION_SOL = 80n * SOL; // do not buy this close to migrating.
-const PROBE_STAKE = MIN_BUY; // 0.01 SOL probe round trip.
-const PACE_TARGET_COINS = 25; // coins to trade over the window.
-const PACE_WINDOW_SLOTS = 403_000; // ~24 h of slots in the dev window.
 const MAX_ORDERS = 16; // hello.caps.max_orders_per_batch.
 
 // ------------------------------------------------------------------ helpers
@@ -86,7 +83,6 @@ interface Pos {
   entrySlot: number;
   lastBuyPrice: number;
   peakValue: number; // lamports, best mark value since entry.
-  probe: boolean;
 }
 
 function priceOf(state: BotState, mint: Pubkey): number | null {
@@ -115,9 +111,6 @@ function tapeBuyers(tape: Tape): number {
 const tapes = new Map<Pubkey, Tape>();
 const positions = new Map<Pubkey, Pos>();
 const cooldown = new Map<Pubkey, number>(); // mint -> slot the exit was decided.
-let coinsTraded = 0;
-let startSlot = -1;
-const countedCoins = new Set<Pubkey>();
 
 function noteTrade(mint: Pubkey, slot: number, price: number, isBuy: boolean, sol: bigint, user: Pubkey): void {
   let tape = tapes.get(mint);
@@ -131,7 +124,6 @@ function noteTrade(mint: Pubkey, slot: number, price: number, isBuy: boolean, so
 
 await runBot({
   onBatch(state, batch: Batch): OrderInput[] {
-    if (startSlot < 0) startSlot = batch.slot;
     const orders: OrderInput[] = [];
     const txFee = state.txFeeLamports();
     let free = state.freeCashLamports();
@@ -149,12 +141,8 @@ await runBot({
       }
     }
 
-    // Track fills: a buy that landed on a new coin counts it as traded.
+    // Track fills: a sell that landed closes the position's bookkeeping.
     for (const f of batch.fills) {
-      if (f.side === 'buy' && f.status === 'filled' && !countedCoins.has(f.mint)) {
-        countedCoins.add(f.mint);
-        coinsTraded += 1;
-      }
       if (f.side === 'sell' && f.status === 'filled') {
         const pos = positions.get(f.mint);
         if (pos !== undefined && state.positions.get(f.mint) === undefined) {
@@ -166,7 +154,7 @@ await runBot({
 
     // Forget positions the harness closed (complete / flatten).
     for (const mint of [...positions.keys()]) {
-      if (!state.positions.has(mint) && !state.pending.has(mint)) {
+      if (!state.positions.has(mint)) {
         const hadPendingBuy = [...state.pending.values()].some(
           (p) => p.order.mint === mint && p.order.side === 'buy',
         );
@@ -182,7 +170,7 @@ await runBot({
       const cost = Number(holding.cost_lamports);
       let pos = positions.get(mint);
       if (pos === undefined) {
-        pos = { mint, entrySlot: batch.slot, lastBuyPrice: price, peakValue: value, probe: false };
+        pos = { mint, entrySlot: batch.slot, lastBuyPrice: price, peakValue: value };
         positions.set(mint, pos);
       }
       if (value > pos.peakValue) pos.peakValue = value;
@@ -190,7 +178,7 @@ await runBot({
       const stopHit = value <= cost * STOP_LOSS;
       const trailHit = pos.peakValue >= cost * TRAIL_ARM && value <= pos.peakValue * TRAIL;
       const timeHit = held > MAX_HOLD_SLOTS;
-      if (pos.probe || stopHit || trailHit || timeHit) {
+      if (stopHit || trailHit || timeHit) {
         if (orders.length < MAX_ORDERS) {
           orders.push({
             side: 'sell',
@@ -210,11 +198,6 @@ await runBot({
       if (p.order.side === 'buy') pendingBuys.add(p.order.mint);
     }
     let slots = caps.max_open_positions - state.committedPositionCount();
-
-    // Pace check: are we behind on distinct coins traded?
-    const elapsed = Math.max(0, batch.slot - startSlot);
-    const paceTarget = (elapsed / PACE_WINDOW_SLOTS) * PACE_TARGET_COINS;
-    const needProbe = coinsTraded + 2 < paceTarget;
 
     // Candidates in batch order (deterministic: the batch's own order).
     const seenThisBatch: Pubkey[] = [];
@@ -239,17 +222,12 @@ await runBot({
       const price = priceOf(state, mint);
       if (price === null) continue;
 
-      const isProbe = needProbe;
-      if (!isProbe) {
-        // Flow filters for a real entry.
-        if (tape.trades.length < MIN_TRADES) continue;
-        if (tapeNet(tape) <= 0n) continue;
-        if (tapeBuyers(tape) < MIN_BUYERS) continue;
-        const first = tape.firstPrice > 0 ? tape.firstPrice : price;
-        if (price < first * (1 + MIN_RISE)) continue;
-      }
+      // Flow filters for a real entry: positive net inflow, >= 2 buyers.
+      if (tape.trades.length < MIN_TRADES) continue;
+      if (tapeNet(tape) <= 0n) continue;
+      if (tapeBuyers(tape) < MIN_BUYERS) continue;
 
-      const amount = isProbe ? PROBE_STAKE : cap < INITIAL_STAKE ? cap : INITIAL_STAKE;
+      const amount = cap < INITIAL_STAKE ? cap : INITIAL_STAKE;
       if (free < amount + txFee) continue;
       orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: BUY_SLIPPAGE_BPS });
       free -= amount + txFee;
@@ -259,7 +237,6 @@ await runBot({
         entrySlot: batch.slot,
         lastBuyPrice: price,
         peakValue: 0,
-        probe: isProbe,
       });
     }
 
@@ -268,7 +245,7 @@ await runBot({
       if (orders.length >= MAX_ORDERS) break;
       if (pendingBuys.has(mint)) continue;
       const pos = positions.get(mint);
-      if (pos === undefined || pos.probe) continue;
+      if (pos === undefined) continue;
       if (holding.cost_lamports >= TOTAL_STAKE) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
